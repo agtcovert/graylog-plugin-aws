@@ -1,6 +1,8 @@
 package org.graylog.aws.kinesis;
 
 import com.amazonaws.regions.Region;
+import com.amazonaws.services.kinesis.AmazonKinesis;
+import com.amazonaws.services.kinesis.AmazonKinesisClient;
 import com.amazonaws.services.kinesis.clientlibrary.exceptions.InvalidStateException;
 import com.amazonaws.services.kinesis.clientlibrary.exceptions.ShutdownException;
 import com.amazonaws.services.kinesis.clientlibrary.exceptions.ThrottlingException;
@@ -11,7 +13,7 @@ import com.amazonaws.services.kinesis.clientlibrary.lib.worker.Worker;
 import com.amazonaws.services.kinesis.clientlibrary.types.InitializationInput;
 import com.amazonaws.services.kinesis.clientlibrary.types.ProcessRecordsInput;
 import com.amazonaws.services.kinesis.clientlibrary.types.ShutdownInput;
-import com.amazonaws.services.kinesis.model.Record;
+import com.amazonaws.services.kinesis.model.*;
 import com.github.rholder.retry.Attempt;
 import com.github.rholder.retry.RetryException;
 import com.github.rholder.retry.RetryListener;
@@ -25,12 +27,12 @@ import org.graylog.aws.config.AWSPluginConfiguration;
 import org.graylog.aws.config.Proxy;
 import org.graylog2.plugin.Tools;
 import org.graylog2.plugin.system.NodeId;
-import org.joda.time.DateTime;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 import java.nio.ByteBuffer;
+import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -70,6 +72,7 @@ public class KinesisConsumer implements Runnable {
     // TODO metrics
     public void run() {
         final String workerId = String.format(Locale.ENGLISH, "graylog-node-%s", nodeId.anonymize());
+
         final KinesisClientLibConfiguration config = new KinesisClientLibConfiguration(
                 // The application name needs to be unique per input. Using the same name for two different Kinesis
                 // streams will cause trouble with state handling in DynamoDB. (used by the Kinesis client under the
@@ -80,22 +83,30 @@ public class KinesisConsumer implements Runnable {
                 workerId
         ).withRegionName(region.getName());
 
+        AmazonKinesis client = AmazonKinesisClient.builder()
+                .withCredentials(authProvider)
+                .withRegion(region.getName())
+                .build();
+
         // Optional HTTP proxy
         if (awsConfig.proxyEnabled() && proxyUrl != null) {
             config.withCommonClientConfig(Proxy.forAWS(proxyUrl));
         }
 
         final IRecordProcessorFactory recordProcessorFactory = () -> new IRecordProcessor() {
-            private DateTime lastCheckpoint = DateTime.now();
+            private long lastCheckpoint = System.currentTimeMillis();
+            private String shardId;
+            private boolean checkPointOnShard = false;
 
             @Override
             public void initialize(InitializationInput initializationInput) {
                 LOG.info("Initializing Kinesis worker for stream <{}>", kinesisStreamName);
+                this.shardId = initializationInput.getShardId();
             }
 
             @Override
             public void processRecords(ProcessRecordsInput processRecordsInput) {
-                LOG.debug("Received {} Kinesis events", processRecordsInput.getRecords().size());
+                LOG.info("Received {} Kinesis events", processRecordsInput.getRecords().size());
 
                 for (Record record : processRecordsInput.getRecords()) {
                     try {
@@ -105,19 +116,34 @@ public class KinesisConsumer implements Runnable {
                         final byte[] dataBytes = new byte[dataBuffer.remaining()];
                         dataBuffer.get(dataBytes);
 
-                        dataHandler.accept(Tools.decompressGzip(dataBytes).getBytes());
+                        if (isGzipStream(dataBytes)) {
+                            dataHandler.accept(Tools.decompressGzip(dataBytes).getBytes());
+                        } else {
+                            dataHandler.accept(dataBytes);
+                        }
                     } catch (Exception e) {
                         LOG.error("Couldn't read Kinesis record from stream <{}>", kinesisStreamName, e);
                     }
                 }
 
+                DescribeStreamRequest describeStreamRequest = new DescribeStreamRequest();
+                describeStreamRequest.setStreamName(kinesisStreamName);
+                DescribeStreamResult describeStreamResult = client.describeStream(describeStreamRequest);
+
                 // According to the Kinesis client documentation, we should not checkpoint for every record but
                 // rather periodically.
-                // TODO: Make interval configurable (global)
-                if (lastCheckpoint.plusMinutes(1).isBeforeNow()) {
-                    lastCheckpoint = DateTime.now();
-                    LOG.debug("Checkpointing stream <{}>", kinesisStreamName);
-                    checkpoint(processRecordsInput);
+
+                List<Shard> shards = describeStreamResult.getStreamDescription().getShards();
+                for(Shard shard : shards) {
+                    if(shard.getShardId().equals(this.shardId)) {
+                        this.checkPointOnShard = (shard.getSequenceNumberRange().getEndingSequenceNumber() == null);
+                    }
+                    // TODO: Make interval configurable (global)
+                    if (lastCheckpoint > 10000 || checkPointOnShard) {
+                        lastCheckpoint = System.currentTimeMillis();
+                        LOG.info("Checkpointing stream <{}>", kinesisStreamName);
+                        checkpoint(processRecordsInput);
+                    }
                 }
             }
 
@@ -156,7 +182,13 @@ public class KinesisConsumer implements Runnable {
 
             @Override
             public void shutdown(ShutdownInput shutdownInput) {
-                LOG.info("Shutting down Kinesis worker for stream <{}>", kinesisStreamName);
+                try {
+                    shutdownInput.getCheckpointer().checkpoint();
+                } catch (InvalidStateException e) {
+                    LOG.error("Couldn't save checkpoint to DynamoDB table used by the Kinesis client library - check database table", e);
+                } catch (ShutdownException e) {
+                    LOG.debug("Processor is shutting down, skipping checkpoint");
+                }
             }
         };
 
@@ -174,4 +206,8 @@ public class KinesisConsumer implements Runnable {
         }
     }
 
+    private boolean isGzipStream(byte[] bytes) {
+        int head = ((int) bytes[0] & 0xff) | ((bytes[1] << 8 ) & 0xff00 );
+        return java.util.zip.GZIPInputStream.GZIP_MAGIC == head;
+    }
 }

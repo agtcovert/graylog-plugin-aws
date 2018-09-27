@@ -5,7 +5,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.graylog.aws.inputs.cloudtrail.CloudTrailCodec;
 import org.graylog.aws.inputs.cloudtrail.CloudTrailInput;
 import org.graylog.aws.inputs.cloudtrail.CloudTrailTransport;
+import org.graylog.aws.inputs.cloudwatch.CloudWatchKinesisInput;
 import org.graylog.aws.inputs.cloudwatch.CloudWatchLogsInput;
+import org.graylog.aws.inputs.codecs.CloudWatchKinesisCodec;
 import org.graylog.aws.inputs.codecs.CloudWatchFlowLogCodec;
 import org.graylog.aws.inputs.codecs.CloudWatchRawLogCodec;
 import org.graylog.aws.inputs.flowlogs.FlowLogsInput;
@@ -25,9 +27,14 @@ public class AWSModule extends PluginModule {
         // CloudWatch
         addCodec(CloudWatchFlowLogCodec.NAME, CloudWatchFlowLogCodec.class);
         addCodec(CloudWatchRawLogCodec.NAME, CloudWatchRawLogCodec.class);
+
         addTransport(KinesisTransport.NAME, KinesisTransport.class);
+
         addMessageInput(FlowLogsInput.class);
         addMessageInput(CloudWatchLogsInput.class);
+
+        addCodec(CloudWatchKinesisCodec.NAME, CloudWatchKinesisCodec.class);
+        addMessageInput(CloudWatchKinesisInput.class);
 
         // Instance name lookup
         addMessageProcessor(AWSInstanceNameLookupProcessor.class, AWSInstanceNameLookupProcessor.Descriptor.class);
